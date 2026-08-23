@@ -1,5 +1,7 @@
 // netlify/functions/scrape-linkedin.js
-// 100% FREE — No API keys needed!
+// IMPROVED VERSION — Better LinkedIn data extraction
+
+const fetch = require('node-fetch');
 
 exports.handler = async (event) => {
     if (event.httpMethod !== 'POST') {
@@ -12,46 +14,43 @@ exports.handler = async (event) => {
         if (!url || !url.includes('linkedin.com/in/')) {
             return {
                 statusCode: 400,
-                body: JSON.stringify({ error: 'Invalid LinkedIn URL' })
+                body: JSON.stringify({ error: 'Invalid LinkedIn URL. Must be linkedin.com/in/...' })
             };
         }
 
-        // Method 1: Try direct fetch (might work for public profiles)
-        let html = await fetchWithRetry(url);
+        // Fetch with multiple strategies
+        let html = await fetchWithStrategy(url);
         
-        // Method 2: If blocked, try alternative approach
-        if (!html || html.includes('login') || html.includes('signin')) {
-            html = await fetchWithAlternativeHeaders(url);
-        }
-        
-        // Method 3: Last resort — use public cached version
-        if (!html || html.includes('login')) {
-            const cached = await fetchFromCache(url);
-            if (cached) {
-                return {
-                    statusCode: 200,
-                    body: JSON.stringify(cached)
-                };
-            }
-        }
-
         if (!html || html.includes('login') || html.includes('signin')) {
             return {
                 statusCode: 403,
                 body: JSON.stringify({ 
-                    error: 'Profile is private. Use screenshot upload method instead.',
+                    error: 'Profile is private. Please use screenshot upload method.',
                     note: 'Screenshot method always works!'
                 })
             };
         }
 
-        const data = extractData(html, url);
+        const data = extractLinkedInData(html, url);
+        
+        // Check if we got meaningful data
+        if (!data.fullName && !data.jobTitle && !data.company) {
+            return {
+                statusCode: 404,
+                body: JSON.stringify({ 
+                    error: 'Could not extract profile data. Try screenshot method.',
+                    data: data
+                })
+            };
+        }
+
         return {
             statusCode: 200,
             body: JSON.stringify(data)
         };
 
     } catch (error) {
+        console.error('Scraping error:', error);
         return {
             statusCode: 500,
             body: JSON.stringify({ error: 'Scraping failed: ' + error.message })
@@ -59,40 +58,15 @@ exports.handler = async (event) => {
     }
 };
 
-async function fetchWithRetry(url, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const res = await fetch(url, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Connection': 'keep-alive',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache'
-                }
-            });
-            if (res.ok) {
-                const text = await res.text();
-                if (!text.includes('login') && !text.includes('signin')) {
-                    return text;
-                }
-            }
-            await new Promise(r => setTimeout(r, 1000 * (i + 1)));
-        } catch(e) {}
-    }
-    return null;
-}
-
-async function fetchWithAlternativeHeaders(url) {
-    try {
-        const res = await fetch(url, {
+async function fetchWithStrategy(url) {
+    const strategies = [
+        // Strategy 1: Standard browser
+        {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
                 'Sec-Fetch-Dest': 'document',
@@ -100,43 +74,44 @@ async function fetchWithAlternativeHeaders(url) {
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1'
             }
-        });
-        if (res.ok) {
-            const text = await res.text();
-            if (!text.includes('login') && !text.includes('signin')) {
-                return text;
-            }
-        }
-    } catch(e) {}
-    return null;
-}
-
-async function fetchFromCache(url) {
-    // Try to extract username from URL
-    const username = url.match(/\/in\/([^\/?#]+)/)?.[1];
-    if (!username) return null;
-    
-    // Try Google's cached version
-    try {
-        const cacheUrl = `https://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(url)}`;
-        const res = await fetch(cacheUrl, {
+        },
+        // Strategy 2: Mobile
+        {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9'
             }
-        });
-        if (res.ok) {
-            const html = await res.text();
-            if (!html.includes('login')) {
-                const data = extractData(html, url);
-                data.fromCache = true;
-                return data;
+        },
+        // Strategy 3: Old browser
+        {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
             }
         }
-    } catch(e) {}
+    ];
+
+    for (const strategy of strategies) {
+        try {
+            const res = await fetch(url, { 
+                headers: strategy.headers,
+                timeout: 10000
+            });
+            if (res.ok) {
+                const text = await res.text();
+                if (!text.includes('login') && !text.includes('signin') && !text.includes('auth')) {
+                    return text;
+                }
+            }
+        } catch(e) {
+            continue;
+        }
+    }
     return null;
 }
 
-function extractData(html, url) {
+function extractLinkedInData(html, url) {
     const data = {
         fullName: '',
         firstName: '',
@@ -147,40 +122,42 @@ function extractData(html, url) {
         industry: '',
         about: '',
         experience: [],
+        education: [],
         skills: [],
         linkedinUrl: url,
-        scrapedAt: new Date().toISOString(),
-        fromCache: false
+        scrapedAt: new Date().toISOString()
     };
 
-    // Extract Name from <title>
-    const titleMatch = html.match(/<title>(.*?)<\/title>/);
-    if (titleMatch) {
-        let name = titleMatch[1].replace(' | LinkedIn', '').replace(' - LinkedIn', '').trim();
-        if (name) {
-            data.fullName = name;
-            const parts = name.split(' ');
-            data.firstName = parts[0] || '';
-            data.lastName = parts.slice(1).join(' ') || '';
-        }
-    }
-
-    // Extract from JSON-LD
-    const jsonLdMatch = html.match(/<script type="application\/ld\+json">(.*?)<\/script>/s);
-    if (jsonLdMatch) {
+    // ============ METHOD 1: Extract from JSON-LD ============
+    const jsonLdRegex = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g;
+    let match;
+    while ((match = jsonLdRegex.exec(html)) !== null) {
         try {
-            const jsonData = JSON.parse(jsonLdMatch[1]);
-            if (jsonData.name) data.fullName = jsonData.name;
-            if (jsonData.jobTitle) data.jobTitle = jsonData.jobTitle;
-            if (jsonData.worksFor?.name) data.company = jsonData.worksFor.name;
-            if (jsonData.location?.address?.addressCountry) data.location = jsonData.location.address.addressCountry;
+            const json = JSON.parse(match[1]);
+            if (json['@type'] === 'Person') {
+                if (json.name) {
+                    data.fullName = json.name;
+                    const parts = json.name.split(' ');
+                    data.firstName = parts[0] || '';
+                    data.lastName = parts.slice(1).join(' ') || '';
+                }
+                if (json.jobTitle) data.jobTitle = json.jobTitle;
+                if (json.worksFor?.name) data.company = json.worksFor.name;
+                if (json.location?.address?.addressCountry) data.location = json.location.address.addressCountry;
+                if (json.description && !data.about) data.about = json.description;
+            }
         } catch(e) {}
     }
 
-    // Extract from meta tags
-    const metaTitle = html.match(/<meta property="og:title" content="(.*?)"/);
-    if (metaTitle) {
-        let name = metaTitle[1].replace(' | LinkedIn', '').trim();
+    // ============ METHOD 2: Extract from meta tags ============
+    const metaTags = {
+        title: html.match(/<meta property="og:title" content="([^"]*)"/),
+        description: html.match(/<meta property="og:description" content="([^"]*)"/),
+        url: html.match(/<meta property="og:url" content="([^"]*)"/)
+    };
+
+    if (metaTags.title && metaTags.title[1]) {
+        let name = metaTags.title[1].replace(' | LinkedIn', '').replace(' - LinkedIn', '').trim();
         if (name && !data.fullName) {
             data.fullName = name;
             const parts = name.split(' ');
@@ -189,73 +166,106 @@ function extractData(html, url) {
         }
     }
 
-    // Extract headline from meta description
-    const metaDesc = html.match(/<meta property="og:description" content="(.*?)"/);
-    if (metaDesc) {
-        const desc = metaDesc[1];
-        if (desc && !data.jobTitle) {
-            // Try to extract job title from description
-            const titleMatch2 = desc.match(/^(.+?)(?: at | - | \| |,)/);
-            if (titleMatch2) {
-                data.jobTitle = titleMatch2[1].trim();
+    if (metaTags.description && metaTags.description[1]) {
+        const desc = metaTags.description[1];
+        // Extract job title from description
+        const titleMatch = desc.match(/^([^·|,]+)/);
+        if (titleMatch && !data.jobTitle) {
+            data.jobTitle = titleMatch[1].trim();
+        }
+        // Extract company from description
+        const companyMatch = desc.match(/(?:at|@)\s+([A-Z][a-zA-Z0-9\s&.]+)/);
+        if (companyMatch && !data.company) {
+            data.company = companyMatch[1].trim();
+        }
+    }
+
+    // ============ METHOD 3: Extract from HTML elements ============
+    // Name from h1
+    const h1Match = html.match(/<h1[^>]*>([^<]*)<\/h1>/);
+    if (h1Match && h1Match[1].trim() && !data.fullName) {
+        data.fullName = h1Match[1].trim();
+        const parts = data.fullName.split(' ');
+        data.firstName = parts[0] || '';
+        data.lastName = parts.slice(1).join(' ') || '';
+    }
+
+    // Job title from various patterns
+    if (!data.jobTitle) {
+        const titlePatterns = [
+            /<div[^>]*class="[^"]*text-body-medium[^"]*"[^>]*>([^<]*)<\/div>/,
+            /<div[^>]*class="[^"]*headline[^"]*"[^>]*>([^<]*)<\/div>/,
+            /<span[^>]*class="[^"]*top-card__subline-item[^"]*"[^>]*>([^<]*)<\/span>/
+        ];
+        for (const pattern of titlePatterns) {
+            const match = html.match(pattern);
+            if (match && match[1].trim()) {
+                data.jobTitle = match[1].trim();
+                break;
             }
         }
     }
 
-    // Extract company from various patterns
+    // Company from various patterns
     if (!data.company) {
         const companyPatterns = [
-            /"companyName":"(.*?)"/,
-            /"worksFor":.*?"name":"(.*?)"/,
-            /at\s+([A-Z][a-zA-Z0-9\s\.&]+?)(?:\s*[,\|]|\s*$)/,
-            /<a[^>]*data-field="company"[^>]*>(.*?)<\/a>/
+            /<a[^>]*data-anonymize="company-name"[^>]*>([^<]*)<\/a>/,
+            /<span[^>]*class="[^"]*company-name[^"]*"[^>]*>([^<]*)<\/span>/,
+            /"companyName":"([^"]+)"/,
+            /at\s+([A-Z][a-zA-Z0-9\s&.]+)(?=\s*[,\|]|\s*$)/
         ];
         for (const pattern of companyPatterns) {
             const match = html.match(pattern);
-            if (match) {
+            if (match && match[1].trim()) {
                 data.company = match[1].trim();
                 break;
             }
         }
     }
 
-    // Extract location
+    // Location
     if (!data.location) {
         const locationPatterns = [
-            /"address":.*?"addressCountry":"(.*?)"/,
-            /"location":.*?"name":"(.*?)"/,
-            /<span[^>]*class="[^"]*location[^"]*"[^>]*>(.*?)<\/span>/
+            /<span[^>]*class="[^"]*location[^"]*"[^>]*>([^<]*)<\/span>/,
+            /"location":\{"@type":"Place","name":"([^"]+)"/
         ];
         for (const pattern of locationPatterns) {
             const match = html.match(pattern);
-            if (match) {
+            if (match && match[1].trim()) {
                 data.location = match[1].trim();
                 break;
             }
         }
     }
 
-    // Extract about
-    const aboutMatch = html.match(/"summary":"(.*?)"/);
-    if (aboutMatch) {
-        data.about = aboutMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    // About/Summary
+    if (!data.about) {
+        const aboutMatch = html.match(/"summary":"([^"]+)"/);
+        if (aboutMatch) {
+            data.about = aboutMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+        }
     }
 
-    // Extract experience
-    const expMatch = html.match(/"positions":\[(.*?)\]/s);
-    if (expMatch) {
+    // Experience
+    const expMatches = html.match(/"positions":\[([\s\S]*?)\]/);
+    if (expMatches) {
         try {
-            const positions = JSON.parse('[' + expMatch[1] + ']');
+            const positions = JSON.parse('[' + expMatches[1] + ']');
             if (Array.isArray(positions)) {
                 data.experience = positions.map(p => {
-                    return `${p.title || ''} at ${p.companyName || ''}`;
+                    const title = p.title || '';
+                    const company = p.companyName || '';
+                    const dateRange = p.dateRange || {};
+                    const start = dateRange.start || '';
+                    const end = dateRange.end || 'Present';
+                    return `${title} at ${company} (${start} - ${end})`;
                 }).filter(Boolean);
             }
         } catch(e) {}
     }
 
-    // Extract skills
-    const skillsMatch = html.match(/"skills":\[(.*?)\]/s);
+    // Skills
+    const skillsMatch = html.match(/"skills":\[([\s\S]*?)\]/);
     if (skillsMatch) {
         try {
             const skills = JSON.parse('[' + skillsMatch[1] + ']');
@@ -265,28 +275,54 @@ function extractData(html, url) {
         } catch(e) {}
     }
 
-    // Fallback: Try to extract from visible text
-    if (!data.fullName) {
-        const nameMatch = html.match(/<h1[^>]*class="[^"]*"[^>]*>(.*?)<\/h1>/);
-        if (nameMatch) {
-            data.fullName = nameMatch[1].trim();
-            const parts = data.fullName.split(' ');
-            data.firstName = parts[0] || '';
-            data.lastName = parts.slice(1).join(' ') || '';
-        }
+    // Education
+    const eduMatch = html.match(/"education":\[([\s\S]*?)\]/);
+    if (eduMatch) {
+        try {
+            const edu = JSON.parse('[' + eduMatch[1] + ']');
+            if (Array.isArray(edu)) {
+                data.education = edu.map(e => {
+                    const school = e.schoolName || '';
+                    const degree = e.degreeName || '';
+                    const field = e.fieldOfStudy || '';
+                    return `${degree} ${field} at ${school}`.trim();
+                }).filter(Boolean);
+            }
+        } catch(e) {}
     }
 
-    if (!data.jobTitle) {
-        const titleMatch3 = html.match(/<div[^>]*class="[^"]*headline[^"]*"[^>]*>(.*?)<\/div>/);
-        if (titleMatch3) {
-            data.jobTitle = titleMatch3[1].trim();
+    // ============ METHOD 4: Try to extract from text content ============
+    // If still no data, try to parse visible text
+    if (!data.fullName || !data.jobTitle) {
+        const textContent = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        const lines = textContent.split('.').filter(s => s.trim().length > 0);
+        
+        // Look for name pattern (2-3 words at start)
+        if (!data.fullName) {
+            const nameMatch = textContent.match(/^([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/);
+            if (nameMatch) {
+                data.fullName = nameMatch[1];
+                const parts = data.fullName.split(' ');
+                data.firstName = parts[0] || '';
+                data.lastName = parts.slice(1).join(' ') || '';
+            }
         }
     }
 
     // Clean up
     Object.keys(data).forEach(key => {
         if (typeof data[key] === 'string') {
-            data[key] = data[key].replace(/\\/g, '').replace(/"/g, '').trim();
+            data[key] = data[key]
+                .replace(/\\/g, '')
+                .replace(/"/g, '')
+                .replace(/&quot;/g, '"')
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .trim();
+        }
+        if (Array.isArray(data[key])) {
+            data[key] = data[key].filter(Boolean);
         }
     });
 
